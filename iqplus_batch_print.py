@@ -5,16 +5,23 @@ import re
 import sys
 import threading
 import time
+import ctypes
+import tempfile
+import shutil
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from tkinter import END, BOTH, DISABLED, NORMAL, Button, Frame, Label, Listbox, Tk, filedialog, messagebox
 from tkinter import ttk
 from PIL import Image, ImageTk
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 # Tk's Windows shell folder picker requires an STA main thread. Set this
 # before importing pywinauto/comtypes, which otherwise initializes MTA.
 sys.coinit_flags = 2
 from pywinauto import Desktop, keyboard
 from pywinauto.timings import TimeoutError as PywinautoTimeoutError
+import win32timezone  # Required dynamically by pywin32 when reading print jobs.
 
 
 APP_TITLE = "iQ+ Batch PDF Printer"
@@ -24,6 +31,40 @@ VIEWER_TITLE_RE = r".*Waveform Viewer.*"
 
 class BatchError(Exception):
     pass
+
+
+def printer_jobs():
+    import win32print
+    printer = win32print.OpenPrinter(DEFAULT_PRINTER)
+    try:
+        return win32print.EnumJobs(printer, 0, 999, 1)
+    finally:
+        win32print.ClosePrinter(printer)
+
+
+def print_progress(previous_jobs):
+    try:
+        return tuple(sorted((j['JobId'], j.get('TotalPages', 0), j.get('PagesPrinted', 0))
+                            for j in printer_jobs() if j['JobId'] not in previous_jobs))
+    except Exception:
+        return None
+
+
+@contextmanager
+def keep_awake():
+    # Execution-state requests belong to the calling thread; release on that
+    # same batch worker even when conversion raises an exception.
+    continuous = 0x80000000
+    set_state = ctypes.windll.kernel32.SetThreadExecutionState
+    set_state.argtypes = [ctypes.c_uint]
+    set_state.restype = ctypes.c_uint
+    previous = set_state(continuous | 0x00000001 | 0x00000002)
+    if not previous:
+        raise BatchError("Windows could not enable sleep prevention.")
+    try:
+        yield
+    finally:
+        set_state(previous | continuous)
 
 
 def pdf_is_complete(path: Path) -> bool:
@@ -42,25 +83,51 @@ def clean_pdf_name(cdf_path: Path) -> str:
     return cdf_path.with_suffix(".pdf").name
 
 
-def wait_for_file_stable(path: Path, timeout: float = 180.0, stable_seconds: float = 2.0) -> None:
-    deadline = time.time() + timeout
-    last_size = -1
-    stable_from = None
+def completed_output_exists(cdf_path: Path, output_pdf: Path) -> bool:
+    try:
+        return (output_pdf.stat().st_mtime_ns >= cdf_path.stat().st_mtime_ns
+                and pdf_is_complete(output_pdf))
+    except OSError:
+        return False
 
-    while time.time() < deadline:
-        if path.exists():
-            size = path.stat().st_size
-            if size > 0 and size == last_size:
+
+def wait_for_file_stable(path: Path, timeout: float = 1800.0, stable_seconds: float = 5.0, log=print, progress=None) -> None:
+    deadline = time.monotonic() + timeout
+    last_change = None
+    stable_from = None
+    next_update = time.monotonic() + 30
+    last_print_progress = None
+    next_print_check = 0
+
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if progress is not None and now >= next_print_check:
+            current = progress()
+            if current and current != last_print_progress:
+                deadline = now + timeout
+                log(f"Print queue progress: {current}")
+            last_print_progress = current
+            next_print_check = now + 5
+        try:
+            stat = path.stat()
+            change = (stat.st_size, stat.st_mtime_ns)
+            if stat.st_size > 0 and change == last_change:
                 if stable_from is None:
-                    stable_from = time.time()
-                elif time.time() - stable_from >= stable_seconds and pdf_is_complete(path):
+                    stable_from = now
+                elif now - stable_from >= stable_seconds and pdf_is_complete(path):
                     return
-            else:
+            elif change != last_change:
                 stable_from = None
-                last_size = size
+                last_change = change
+                deadline = now + timeout
+        except OSError:
+            stable_from = None
+        if now >= next_update:
+            log(f"Waiting for PDF to finish: {path.name}")
+            next_update = now + 30
         time.sleep(0.4)
 
-    raise BatchError(f"Timed out waiting for PDF to finish: {path}")
+    raise BatchError(f"PDF did not finish and showed no file progress for {timeout / 60:g} minutes: {path}")
 
 
 def wait_window(title_re: str, timeout: float, process=None):
@@ -93,7 +160,7 @@ def close_iqplus_windows() -> None:
 
 
 def set_pdf_path_in_save_dialog(output_pdf: Path) -> None:
-    save = wait_window(r"^(Save Print Output As|Save As)$", 60)
+    save = wait_window(r"^(Save Print Output As|Save As)$", 1800)
     save.set_focus()
     time.sleep(0.3)
 
@@ -126,7 +193,7 @@ def set_pdf_path_in_save_dialog(output_pdf: Path) -> None:
     submit_pdf_save(save, output_pdf)
 
 
-def submit_pdf_save(save, output_pdf: Path, timeout=45.0) -> None:
+def submit_pdf_save(save, output_pdf: Path, timeout=1800.0) -> None:
     deadline = time.monotonic() + timeout
     last_click = -float("inf")
     attempts = 0
@@ -175,12 +242,11 @@ def print_one_cdf(cdf_path: Path, output_pdf: Path, log=print) -> None:
     if not cdf_path.exists():
         raise BatchError(f"CDF file not found: {cdf_path}")
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    if output_pdf.exists():
-        output_pdf.unlink()
+    previous_jobs = {j['JobId'] for j in printer_jobs()}
 
     log(f"Opening in iQ+: {cdf_path.name}")
     os.startfile(str(cdf_path))
-    viewer = wait_window(VIEWER_TITLE_RE, 45)
+    viewer = wait_window(VIEWER_TITLE_RE, 300)
     viewer.set_focus()
     time.sleep(2.0)
 
@@ -188,7 +254,7 @@ def print_one_cdf(cdf_path: Path, output_pdf: Path, log=print) -> None:
     keyboard.send_keys("^p")
 
     try:
-        print_dialog = wait_window(r"^Print$", 45, process=viewer.process_id())
+        print_dialog = wait_window(r"^Print$", 1800, process=viewer.process_id())
     except (PywinautoTimeoutError, BatchError) as exc:
         raise BatchError("The iQ+ Print dialog did not appear after Ctrl+P.") from exc
 
@@ -204,8 +270,20 @@ def print_one_cdf(cdf_path: Path, output_pdf: Path, log=print) -> None:
         raise BatchError("Could not activate the Print dialog OK button.") from exc
 
     log(f"Saving PDF: {output_pdf.resolve()}")
-    set_pdf_path_in_save_dialog(output_pdf)
-    wait_for_file_stable(output_pdf)
+    # Finish printing locally before publishing to a network/output folder.
+    with tempfile.TemporaryDirectory(prefix="iqplus-pdf-") as scratch:
+        local_pdf = Path(scratch) / output_pdf.name
+        set_pdf_path_in_save_dialog(local_pdf)
+        wait_for_file_stable(local_pdf, log=log, progress=lambda: print_progress(previous_jobs))
+        staging = output_pdf.with_name(f".{output_pdf.stem}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copyfile(local_pdf, staging)
+            if not pdf_is_complete(staging):
+                raise BatchError(f"The copied PDF did not pass the completion check: {output_pdf}")
+            staging.replace(output_pdf)
+        finally:
+            if staging.exists():
+                staging.unlink()
 
     log(f"Done: {output_pdf}")
     try:
@@ -227,6 +305,7 @@ def expand_inputs(paths: list[str]) -> list[Path]:
     return cdfs
 
 
+@keep_awake()
 def convert_batch(cdfs: list[Path], output_dir: Path | None, log=print) -> int:
     if not cdfs:
         raise BatchError("No .cdf files were selected.")
@@ -234,15 +313,20 @@ def convert_batch(cdfs: list[Path], output_dir: Path | None, log=print) -> int:
     log("Please leave iQ+ and the print dialogs in front while the batch runs.")
     close_iqplus_windows()
     completed = 0
+    skipped = 0
 
     for index, cdf_path in enumerate(cdfs, start=1):
         target_dir = output_dir if output_dir else cdf_path.parent
         output_pdf = target_dir / clean_pdf_name(cdf_path)
         log(f"[{index}/{len(cdfs)}] {cdf_path.name}")
+        if completed_output_exists(cdf_path, output_pdf):
+            log(f"Skipped completed: {output_pdf}")
+            skipped += 1
+            continue
         print_one_cdf(cdf_path, output_pdf, log=log)
         completed += 1
 
-    log(f"Finished {completed} file(s).")
+    log(f"Finished: {completed} converted, {skipped} already completed.")
     return completed
 
 
@@ -273,6 +357,7 @@ class BatchGui:
         self.messages: queue.Queue[str] = queue.Queue()
         self.scan_results = queue.Queue()
         self.scanning = False
+        self.running = False
 
         top = Frame(root, bg="#f3f4f5")
         top.pack(fill="x", padx=24, pady=20)
@@ -298,6 +383,12 @@ class BatchGui:
         scroll = ttk.Scrollbar(self.listbox, orient="vertical", command=self.listbox.yview)
         scroll.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.drop_target_register(DND_FILES)
+        self.listbox.dnd_bind('<<Drop>>', self.on_drop)
+        self.drop_hint = Label(self.listbox, text="Drag and drop CDF files or folders here", bg="white", fg="#92999e", font=("Segoe UI", 12))
+        self.drop_hint.place(relx=0.5, rely=0.5, anchor="center")
+        self.drop_hint.drop_target_register(DND_FILES)
+        self.drop_hint.dnd_bind('<<Drop>>', self.on_drop)
 
         Label(root, text="ACTIVITY", anchor="w", bg="#f3f4f5", fg="#343a3c", font=("Segoe UI", 10, "bold")).pack(fill="x", padx=24, pady=(14, 4))
         self.logbox = Listbox(root, height=8)
@@ -316,6 +407,23 @@ class BatchGui:
 
     def log(self, message: str) -> None:
         self.messages.put(message)
+
+    def on_drop(self, event):
+        if self.running or self.scanning:
+            self.log("Wait for the current batch or scan before adding files.")
+            return "none"
+        paths = self.root.tk.splitlist(event.data)
+        self.scanning = True
+        self.start_button.config(state=DISABLED)
+        self.log("Reading dropped files and folders...")
+        threading.Thread(target=self.scan_paths, args=(paths,), daemon=True).start()
+        return "copy"
+
+    def scan_paths(self, paths):
+        try:
+            self.scan_results.put((expand_inputs(list(paths)), None))
+        except Exception as exc:
+            self.scan_results.put(([], str(exc)))
 
     def drain_messages(self) -> None:
         try:
@@ -338,17 +446,19 @@ class BatchGui:
             self.logbox.insert(END, message)
             self.logbox.see(END)
             self.status.config(text=message)
-            if message.startswith("Done:"):
+            if message.startswith(("Done:", "Skipped completed:")):
                 self.completed += 1
                 self.progress.config(value=self.completed)
         self.root.after(200, self.drain_messages)
 
     def add_files(self) -> None:
+        if self.running or self.scanning:
+            return
         selected = filedialog.askopenfilenames(parent=self.root, title="Select CDF files", filetypes=[("CDF files", "*.cdf")])
         self.add_paths(selected)
 
     def add_folder(self) -> None:
-        if self.scanning:
+        if self.scanning or self.running:
             return
         selected = filedialog.askdirectory(parent=self.root, title="Select a folder containing CDF files", mustexist=True)
         if selected:
@@ -375,18 +485,25 @@ class BatchGui:
                 existing.add(key)
                 self.listbox.insert(END, str(path))
         self.queue_label.config(text=f"FILES  /  {len(self.files)}")
+        if self.files:
+            self.drop_hint.place_forget()
 
     def choose_output(self) -> None:
+        if self.running:
+            return
         selected = filedialog.askdirectory(parent=self.root, title="Select output folder", mustexist=True)
         if selected:
             self.output_dir = Path(selected)
             self.output_label.config(text=f"Output: {self.output_dir}")
 
     def start(self) -> None:
+        if self.running or self.scanning:
+            return
         if not self.files:
             messagebox.showerror(APP_TITLE, "Add at least one .cdf file first.")
             return
         self.start_button.config(state=DISABLED)
+        self.running = True
         self.completed = 0
         self.progress.config(maximum=len(self.files), value=0)
         worker = threading.Thread(target=self.run_batch, daemon=True)
@@ -404,7 +521,11 @@ class BatchGui:
             self.root.after(0, lambda: messagebox.showerror(APP_TITLE, error))
         finally:
             pythoncom.CoUninitialize()
-            self.root.after(0, lambda: self.start_button.config(state=NORMAL))
+            self.root.after(0, self.batch_finished)
+
+    def batch_finished(self):
+        self.running = False
+        self.start_button.config(state=NORMAL)
 
 
 def main(argv: list[str]) -> int:
@@ -415,7 +536,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.gui or not args.paths:
-        root = Tk()
+        root = TkinterDnD.Tk()
         app = BatchGui(root)
         app.add_paths(args.paths)
         root.mainloop()

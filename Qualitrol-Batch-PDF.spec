@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+dnd_datas, dnd_binaries, dnd_imports = collect_all('tkinterdnd2')
 
 
 a = Analysis(
     ['iqplus_batch_print.py'],
     pathex=[],
-    binaries=[],
-    datas=[('assets', 'assets')],
-    hiddenimports=[],
+    binaries=dnd_binaries,
+    datas=[('assets', 'assets')] + dnd_datas,
+    hiddenimports=['win32timezone'] + dnd_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
